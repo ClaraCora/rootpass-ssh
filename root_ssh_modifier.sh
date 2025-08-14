@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #=============================================================
 # Root Password and SSH Port Modifier
-# Description: One-click script to modify root password and SSH port
-# Version: 1.0
+# Description: Modify root password and SSH port
+#              + enable key-based login for root
+#              + fetch keys from GitHub username
+# Version: 1.2
 # Author: Assistant
 #=============================================================
 
-VERSION=1.0
+VERSION=1.2
 RED_FONT_PREFIX="\033[31m"
 LIGHT_GREEN_FONT_PREFIX="\033[1;32m"
 YELLOW_FONT_PREFIX="\033[1;33m"
@@ -20,170 +22,201 @@ SUCCESS="[${BLUE_FONT_PREFIX}SUCCESS${FONT_COLOR_SUFFIX}]"
 # 检查是否为root用户
 [ $EUID != 0 ] && SUDO=sudo
 
-# 检测系统类型
+#---------------------- 基础工具与系统 -----------------------
 detect_system() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        OS=$NAME
-        VER=$VERSION_ID
+        OS=$NAME; VER=$VERSION_ID
     elif type lsb_release >/dev/null 2>&1; then
-        OS=$(lsb_release -si)
-        VER=$(lsb_release -sr)
+        OS=$(lsb_release -si); VER=$(lsb_release -sr)
     elif [ -f /etc/lsb-release ]; then
-        . /etc/lsb-release
-        OS=$DISTRIB_ID
-        VER=$DISTRIB_RELEASE
+        . /etc/lsb-release; OS=$DISTRIB_ID; VER=$DISTRIB_RELEASE
     elif [ -f /etc/debian_version ]; then
-        OS=Debian
-        VER=$(cat /etc/debian_version)
-    elif [ -f /etc/SuSe-release ]; then
-        OS=SuSE
+        OS=Debian; VER=$(cat /etc/debian_version)
     elif [ -f /etc/redhat-release ]; then
         OS=RedHat
     else
-        OS=$(uname -s)
-        VER=$(uname -r)
+        OS=$(uname -s); VER=$(uname -r)
     fi
     echo -e "${INFO} 检测到系统: ${OS} ${VER}"
 }
 
-# 显示使用说明
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || { echo -e "${ERROR} 需要命令: $1"; exit 1; }
+}
+
+#---------------------- 用法 -----------------------
 USAGE() {
-    echo "
-Root密码和SSH端口修改器 $VERSION
+cat <<'EOF'
+Root密码和SSH端口修改器 1.2
 
 用法:
   bash root_ssh_modifier.sh [选项]
 
 选项:
-  -p <端口号>    修改SSH端口 (默认: 22)
-  -r <新密码>    修改root密码
-  -a             同时修改密码和端口
-  -e             启用密码登录 (当服务器只允许密钥登录时)
-  -h             显示此帮助信息
+  -p <端口号>        修改SSH端口 (默认: 22)
+  -r <新密码>        修改root密码
+  -a                 同时修改密码和端口
+  -e                 启用密码登录
+  -D                 禁用密码登录，仅允许密钥
+  -k <公钥或文件>    安装指定公钥(字符串或*.pub路径)
+  -g <GitHub用户名>  拉取 GitHub 公钥并安装为登录密钥
+  -h                 显示帮助
 
 示例:
-  bash root_ssh_modifier.sh -p 2222                    # 只修改SSH端口为2222
-  bash root_ssh_modifier.sh -r 'newpassword123'        # 只修改root密码
-  bash root_ssh_modifier.sh -a -p 2222 -r 'newpass'    # 同时修改端口和密码
-  bash root_ssh_modifier.sh -e                         # 启用密码登录
-  bash root_ssh_modifier.sh -a -p 2222 -r 'pass' -e    # 修改端口、密码并启用密码登录
-"
+  bash root_ssh_modifier.sh -g alice
+  bash root_ssh_modifier.sh -g alice -D
+  bash root_ssh_modifier.sh -k ~/.ssh/id_ed25519.pub -p 2222
+EOF
 }
 
-# 修改root密码
+#---------------------- SSH 配置辅助 -----------------------
+backup_sshd_once() {
+    [ -f /etc/ssh/sshd_config ] || { echo -e "${ERROR} 未找到 /etc/ssh/sshd_config"; exit 1; }
+    if [ -z "$SSHD_BACKED_UP" ]; then
+        $SUDO cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+        SSHD_BACKED_UP=1
+        echo -e "${INFO} 已备份 sshd_config"
+    fi
+}
+
+set_sshd_option() {
+    local key="$1" val="$2"
+    backup_sshd_once
+    if grep -qE "^\s*${key}\s+" /etc/ssh/sshd_config; then
+        $SUDO sed -i "s@^\s*${key}\s\+.*@${key} ${val}@" /etc/ssh/sshd_config
+    else
+        echo "${key} ${val}" | $SUDO tee -a /etc/ssh/sshd_config >/dev/null
+    fi
+    RESTART_SSHD=1
+}
+
+#---------------------- 账户与密钥 -----------------------
+root_home() { getent passwd root | cut -d: -f6; }
+
+install_keys_to_root() {
+    # 读取 stdin 的公钥，过滤有效行，去重并写入 authorized_keys
+    local RH; RH="$(root_home)"
+    local SSH_DIR="${RH}/.ssh"
+    local AUTH="${SSH_DIR}/authorized_keys"
+    local tmp keys_filtered
+
+    $SUDO mkdir -p "$SSH_DIR"
+    $SUDO touch "$AUTH"
+    $SUDO chown -R root:root "$SSH_DIR"
+    $SUDO chmod 700 "$SSH_DIR"
+    $SUDO chmod 600 "$AUTH"
+
+    keys_filtered=$(cat | grep -E '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521))\s' || true)
+    if [ -z "$keys_filtered" ]; then
+        echo -e "${ERROR} 未检测到有效公钥"
+        exit 1
+    fi
+
+    $SUDO sh -c "printf '\n# added by root_ssh_modifier %s (v%s)\n' '$(date -u +%FT%TZ)' '${VERSION}' >> '$AUTH'"
+    echo "$keys_filtered" | $SUDO tee -a "$AUTH" >/dev/null
+
+    tmp=$($SUDO mktemp)
+    if [ -n "$SUDO" ]; then
+        $SUDO sh -c "awk 'NF' '$AUTH' | sort -u > '$tmp' && mv '$tmp' '$AUTH' && chown root:root '$AUTH' && chmod 600 '$AUTH'"
+    else
+        awk 'NF' "$AUTH" | sort -u > "$tmp" && mv "$tmp" "$AUTH" && chown root:root "$AUTH" && chmod 600 "$AUTH"
+    fi
+    restorecon -R "$SSH_DIR" 2>/dev/null || true
+
+    echo -e "${SUCCESS} 公钥已写入: $AUTH"
+    set_sshd_option "PubkeyAuthentication" "yes"
+}
+
+add_key_literal_or_file() {
+    local input="$1"
+    if [ -f "$input" ]; then
+        echo -e "${INFO} 从文件读取公钥: $input"
+        cat "$input" | install_keys_to_root
+    else
+        echo -e "${INFO} 使用提供的公钥字串"
+        printf '%s\n' "$input" | install_keys_to_root
+    fi
+}
+
+fetch_github_keys() {
+    local user="$1"
+    need_cmd awk
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "https://github.com/${user}.keys"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "https://github.com/${user}.keys"
+    else
+        echo -e "${ERROR} 需要 curl 或 wget 拉取 GitHub 公钥" >&2
+        return 1
+    fi
+}
+
+add_keys_from_github() {
+    local gh_user="$1"
+    echo -e "${INFO} 正在从 GitHub 拉取公钥: ${gh_user}"
+    keys="$(fetch_github_keys "$gh_user" || true)"
+    if [ -z "$keys" ]; then
+        echo -e "${ERROR} 拉取失败或该用户无公开密钥: ${gh_user}"
+        exit 1
+    fi
+    printf '%s\n' "$keys" | install_keys_to_root
+}
+
+#---------------------- 原有功能 -----------------------
 change_root_password() {
     local new_password="$1"
-    
     if [ -z "$new_password" ]; then
-        echo -e "${WARNING} 请输入新的root密码:"
-        read -s new_password
-        echo
-        if [ -z "$new_password" ]; then
-            echo -e "${ERROR} 密码不能为空!"
-            exit 1
-        fi
+        echo -e "${WARNING} 请输入新的root密码:"; read -s new_password; echo
+        [ -z "$new_password" ] && { echo -e "${ERROR} 密码不能为空!"; exit 1; }
     fi
-    
     echo -e "${INFO} 正在修改root密码..."
-    
-    # 使用chpasswd命令修改密码
-    echo "root:${new_password}" | $SUDO chpasswd
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${SUCCESS} root密码修改成功!"
-    else
-        echo -e "${ERROR} root密码修改失败!"
-        exit 1
-    fi
+    echo "root:${new_password}" | $SUDO chpasswd || { echo -e "${ERROR} root密码修改失败!"; exit 1; }
+    echo -e "${SUCCESS} root密码修改成功!"
 }
 
-# 修改SSH端口
 change_ssh_port() {
     local new_port="$1"
-    
     if [ -z "$new_port" ]; then
-        echo -e "${WARNING} 请输入新的SSH端口 (默认: 2222):"
-        read new_port
-        new_port=${new_port:-2222}
+        echo -e "${WARNING} 请输入新的SSH端口 (默认: 2222):"; read new_port; new_port=${new_port:-2222}
     fi
-    
-    # 验证端口号
     if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-        echo -e "${ERROR} 无效的端口号: $new_port (端口范围: 1-65535)"
-        exit 1
+        echo -e "${ERROR} 无效的端口号: $new_port"; exit 1
     fi
-    
     echo -e "${INFO} 正在修改SSH端口为 $new_port ..."
-    
-    # 备份原配置文件
-    if [ -f /etc/ssh/sshd_config ]; then
-        $SUDO cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
-        echo -e "${INFO} 已备份原配置文件"
-    fi
-    
-    # 修改SSH配置文件
+    backup_sshd_once
     if grep -q "^Port " /etc/ssh/sshd_config; then
-        # 如果已有Port配置，则替换
         $SUDO sed -i "s/^Port .*/Port $new_port/" /etc/ssh/sshd_config
     else
-        # 如果没有Port配置，则添加
-        echo "Port $new_port" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
+        echo "Port $new_port" | $SUDO tee -a /etc/ssh/sshd_config >/dev/null
     fi
-    
-    # 验证修改是否成功
-    if grep -q "^Port $new_port" /etc/ssh/sshd_config; then
-        echo -e "${SUCCESS} SSH端口修改成功!"
-        RESTART_SSHD=1
-    else
-        echo -e "${ERROR} SSH端口修改失败!"
-        exit 1
-    fi
+    grep -q "^Port $new_port" /etc/ssh/sshd_config || { echo -e "${ERROR} SSH端口修改失败!"; exit 1; }
+    echo -e "${SUCCESS} SSH端口修改成功!"
+    RESTART_SSHD=1
 }
 
-# 重启SSH服务
 restart_ssh_service() {
     echo -e "${INFO} 正在重启SSH服务..."
-    
-    # 检测系统类型并重启相应的服务
     if command -v systemctl >/dev/null 2>&1; then
-        # 使用systemctl (新版本系统)
-        if systemctl is-active --quiet sshd; then
-            $SUDO systemctl restart sshd
-        elif systemctl is-active --quiet ssh; then
-            $SUDO systemctl restart ssh
+        if systemctl is-active --quiet sshd; then $SUDO systemctl restart sshd
+        elif systemctl is-active --quiet ssh; then $SUDO systemctl restart ssh
         else
             echo -e "${WARNING} 未找到活动的SSH服务，尝试启动..."
             $SUDO systemctl start sshd 2>/dev/null || $SUDO systemctl start ssh 2>/dev/null
         fi
     elif command -v service >/dev/null 2>&1; then
-        # 使用service命令 (老版本系统)
         $SUDO service ssh restart 2>/dev/null || $SUDO service sshd restart 2>/dev/null
-    elif command -v /etc/init.d/ssh >/dev/null 2>&1; then
-        # 直接使用init脚本
+    elif [ -x /etc/init.d/ssh ]; then
         $SUDO /etc/init.d/ssh restart
     else
         echo -e "${WARNING} 无法自动重启SSH服务，请手动重启"
-        echo -e "${INFO} 可以使用以下命令之一:"
-        echo -e "  systemctl restart sshd"
-        echo -e "  systemctl restart ssh"
-        echo -e "  service ssh restart"
-        echo -e "  /etc/init.d/ssh restart"
         return 1
     fi
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${SUCCESS} SSH服务重启成功!"
-    else
-        echo -e "${ERROR} SSH服务重启失败!"
-        return 1
-    fi
+    [ $? -eq 0 ] && echo -e "${SUCCESS} SSH服务重启成功!" || { echo -e "${ERROR} SSH服务重启失败!"; return 1; }
 }
 
-# 检查SSH服务状态
 check_ssh_status() {
     echo -e "${INFO} 检查SSH服务状态..."
-    
     if command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet sshd; then
             echo -e "${SUCCESS} SSH服务正在运行 (sshd)"
@@ -193,221 +226,96 @@ check_ssh_status() {
             echo -e "${WARNING} SSH服务未运行"
         fi
     else
-        if pgrep sshd >/dev/null; then
-            echo -e "${SUCCESS} SSH服务正在运行"
-        else
-            echo -e "${WARNING} SSH服务未运行"
-        fi
+        if pgrep sshd >/dev/null; then echo -e "${SUCCESS} SSH服务正在运行"
+        else echo -e "${WARNING} SSH服务未运行"; fi
     fi
 }
 
-# 启用密码登录
 enable_password_login() {
     echo -e "${INFO} 正在启用密码登录..."
-    
-    # 备份原配置文件
-    if [ -f /etc/ssh/sshd_config ]; then
-        $SUDO cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
-        echo -e "${INFO} 已备份原配置文件"
-    fi
-    
-    # 修改SSH配置文件以启用密码登录
-    local config_changes=false
-    
-    # 启用密码认证
-    if grep -q "^PasswordAuthentication " /etc/ssh/sshd_config; then
-        $SUDO sed -i "s/^PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config
-        config_changes=true
-    else
-        echo "PasswordAuthentication yes" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
-        config_changes=true
-    fi
-    
-    # 启用公钥认证（保持兼容性）
-    if grep -q "^PubkeyAuthentication " /etc/ssh/sshd_config; then
-        $SUDO sed -i "s/^PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-        config_changes=true
-    else
-        echo "PubkeyAuthentication yes" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
-        config_changes=true
-    fi
-    
-    # 允许root登录（如果需要）
-    if grep -q "^PermitRootLogin " /etc/ssh/sshd_config; then
-        $SUDO sed -i "s/^PermitRootLogin .*/PermitRootLogin yes/" /etc/ssh/sshd_config
-        config_changes=true
-    else
-        echo "PermitRootLogin yes" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
-        config_changes=true
-    fi
-    
-    # 禁用挑战响应认证（简化配置）
-    if grep -q "^ChallengeResponseAuthentication " /etc/ssh/sshd_config; then
-        $SUDO sed -i "s/^ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/" /etc/ssh/sshd_config
-        config_changes=true
-    else
-        echo "ChallengeResponseAuthentication no" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
-        config_changes=true
-    fi
-    
-    # 禁用GSSAPI认证（简化配置）
-    if grep -q "^GSSAPIAuthentication " /etc/ssh/sshd_config; then
-        $SUDO sed -i "s/^GSSAPIAuthentication .*/GSSAPIAuthentication no/" /etc/ssh/sshd_config
-        config_changes=true
-    else
-        echo "GSSAPIAuthentication no" | $SUDO tee -a /etc/ssh/sshd_config > /dev/null
-        config_changes=true
-    fi
-    
-    if [ "$config_changes" = true ]; then
-        echo -e "${SUCCESS} SSH密码登录配置修改成功!"
-        echo -e "${INFO} 已启用以下设置:"
-        echo -e "  - PasswordAuthentication yes"
-        echo -e "  - PubkeyAuthentication yes"
-        echo -e "  - PermitRootLogin yes"
-        echo -e "  - ChallengeResponseAuthentication no"
-        echo -e "  - GSSAPIAuthentication no"
-        RESTART_SSHD=1
-    else
-        echo -e "${WARNING} 未发现需要修改的配置"
-    fi
+    set_sshd_option "PasswordAuthentication" "yes"
+    set_sshd_option "PubkeyAuthentication" "yes"
+    set_sshd_option "PermitRootLogin" "yes"
+    set_sshd_option "ChallengeResponseAuthentication" "no"
+    set_sshd_option "GSSAPIAuthentication" "no"
+    echo -e "${SUCCESS} 已启用密码登录(并保留密钥登录)"
 }
 
-# 显示当前SSH配置
+# 仅密钥登录
+disable_password_login() {
+    echo -e "${INFO} 正在禁用密码登录，仅允许密钥..."
+    set_sshd_option "PasswordAuthentication" "no"
+    # 仅允许root使用密钥登录
+    set_sshd_option "PermitRootLogin" "prohibit-password"
+    set_sshd_option "PubkeyAuthentication" "yes"
+    echo -e "${SUCCESS} 已禁用密码登录"
+}
+
 show_current_config() {
     echo -e "${INFO} 当前SSH配置:"
-    
-    # 显示当前端口
-    current_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    if [ -n "$current_port" ]; then
-        echo -e "  端口: $current_port"
-    else
-        echo -e "  端口: 22 (默认)"
-    fi
-    
-    # 显示密码认证设置
-    password_auth=$(grep "^PasswordAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    if [ -n "$password_auth" ]; then
-        echo -e "  密码认证: $password_auth"
-    else
-        echo -e "  密码认证: yes (默认)"
-    fi
-    
-    # 显示公钥认证设置
-    pubkey_auth=$(grep "^PubkeyAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    if [ -n "$pubkey_auth" ]; then
-        echo -e "  公钥认证: $pubkey_auth"
-    else
-        echo -e "  公钥认证: yes (默认)"
-    fi
-    
-    # 显示root登录设置
-    root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    if [ -n "$root_login" ]; then
-        echo -e "  Root登录: $root_login"
-    else
-        echo -e "  Root登录: yes (默认)"
-    fi
-    
-    # 显示挑战响应认证设置
-    challenge_auth=$(grep "^ChallengeResponseAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    if [ -n "$challenge_auth" ]; then
-        echo -e "  挑战响应认证: $challenge_auth"
-    else
-        echo -e "  挑战响应认证: no (默认)"
-    fi
+    cp=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo -e "  端口: ${cp:-22}"
+    pa=$(grep "^PasswordAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo -e "  密码认证: ${pa:-yes}"
+    pk=$(grep "^PubkeyAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo -e "  公钥认证: ${pk:-yes}"
+    rl=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo -e "  Root登录: ${rl:-yes}"
+    cr=$(grep "^ChallengeResponseAuthentication " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    echo -e "  挑战响应认证: ${cr:-no}"
 }
 
-# 主函数
+#---------------------- 主流程 -----------------------
 main() {
-    local change_password=false
-    local change_port=false
-    local enable_password=false
-    local new_password=""
-    local new_port=""
-    
-    # 检查参数
-    while getopts "p:r:aeh" OPT; do
+    local change_password=false change_port=false enable_password=false disable_password=false
+    local install_key=false github_key=false
+    local new_password="" new_port="" key_input="" gh_user=""
+
+    while getopts "p:r:aekhDg:" OPT; do
         case $OPT in
-            p)
-                change_port=true
-                new_port="$OPTARG"
-                ;;
-            r)
-                change_password=true
-                new_password="$OPTARG"
-                ;;
-            a)
-                change_password=true
-                change_port=true
-                ;;
-            e)
-                enable_password=true
-                ;;
-            h)
-                USAGE
-                exit 0
-                ;;
-            ?)
-                USAGE
-                exit 1
-                ;;
+            p) change_port=true; new_port="$OPTARG" ;;
+            r) change_password=true; new_password="$OPTARG" ;;
+            a) change_password=true; change_port=true ;;
+            e) enable_password=true ;;
+            k) install_key=true; key_input="$OPTARG" ;;
+            g) github_key=true; gh_user="$OPTARG" ;;
+            D) disable_password=true ;;
+            h) USAGE; exit 0 ;;
+            ?) USAGE; exit 1 ;;
         esac
     done
-    
-    # 如果没有参数，显示使用说明
-    if [ $# -eq 0 ]; then
-        USAGE
-        exit 1
-    fi
-    
-    # 检测系统
+
+    [ $# -eq 0 ] && { USAGE; exit 1; }
+
     detect_system
-    
-    # 显示当前配置
-    show_current_config
-    echo
-    
-    # 执行修改操作
-    if [ "$change_password" = true ]; then
-        change_root_password "$new_password"
-        echo
+    show_current_config; echo
+
+    # 修改账户/端口
+    [ "$change_password" = true ] && { change_root_password "$new_password"; echo; }
+    [ "$change_port" = true ] && { change_ssh_port "$new_port"; echo; }
+
+    # 安装密钥
+    if [ "$install_key" = true ]; then
+        add_key_literal_or_file "$key_input"; echo
     fi
-    
-    if [ "$change_port" = true ]; then
-        change_ssh_port "$new_port"
-        echo
+    if [ "$github_key" = true ]; then
+        add_keys_from_github "$gh_user"; echo
     fi
-    
-    if [ "$enable_password" = true ]; then
-        enable_password_login
-        echo
+
+    # 登录策略
+    if [ "$disable_password" = true ]; then
+        disable_password_login; echo
+    elif [ "$enable_password" = true ]; then
+        enable_password_login; echo
     fi
-    
-    # 重启SSH服务
-    if [ "$RESTART_SSHD" = 1 ]; then
-        restart_ssh_service
-        echo
-    fi
-    
-    # 最终检查
+
+    # 重启并检查
+    [ "$RESTART_SSHD" = 1 ] && { restart_ssh_service; echo; }
     check_ssh_status
-    
-    echo -e "${SUCCESS} 所有操作完成!"
-    
+
+    echo -e "${SUCCESS} 操作完成."
     if [ "$change_port" = true ] && [ -n "$new_port" ]; then
-        echo -e "${INFO} 新的SSH端口: $new_port"
-        echo -e "${WARNING} 请使用新端口连接SSH: ssh -p $new_port root@服务器IP"
-    fi
-    
-    if [ "$enable_password" = true ]; then
-        echo -e "${INFO} 密码登录已启用!"
-        echo -e "${WARNING} 现在可以使用密码登录SSH"
-        if [ "$change_password" = true ]; then
-            echo -e "${INFO} 请使用新设置的root密码登录"
-        fi
+        echo -e "${WARNING} 使用新端口连接: ssh -p $new_port root@服务器IP"
     fi
 }
-
-# 执行主函数
-main "$@" 
+main "$@"
