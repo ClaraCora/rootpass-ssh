@@ -94,11 +94,20 @@ sudo ./root_ssh_modifier.sh -a -p 2222 -r 'MySecurePassword123!' -e
 ## 🖥️ 支持的系统
 
 - ✅ **Debian** (所有版本)
-- ✅ **Ubuntu** (所有版本)
+- ✅ **Ubuntu** (所有版本) - 完全优化支持
 - ✅ **CentOS/RHEL** (所有版本)
 - ✅ **Fedora**
 - ✅ **openSUSE**
 - ✅ **其他基于systemd或init的Linux发行版**
+
+### Ubuntu 特别支持
+
+脚本针对Ubuntu系统进行了特别优化：
+
+- **自动检测Ubuntu版本** - 精确识别所有Ubuntu版本
+- **SSH服务名称适配** - 自动识别Ubuntu的`ssh`服务名称
+- **包管理器集成** - 自动检查并提示安装缺失的依赖包
+- **错误处理优化** - 提供Ubuntu特定的错误提示和解决方案
 
 ## 🔧 服务管理支持
 
@@ -214,6 +223,73 @@ ssh -p 2222 root@服务器IP
 # 步骤5: 更新防火墙 (如果需要)
 sudo ufw allow 2222/tcp
 sudo ufw reload
+```
+
+## 🐧 Ubuntu 专用指南
+
+### Ubuntu 系统准备
+
+在Ubuntu系统上使用脚本前，请确保系统已安装必要的依赖：
+
+```bash
+# 更新包列表
+sudo apt update
+
+# 安装必要的工具（脚本会自动检查并提示安装）
+sudo apt install -y curl wget gawk
+
+# 确保SSH服务已安装
+sudo apt install -y openssh-server
+```
+
+### Ubuntu 防火墙配置
+
+Ubuntu使用UFW作为默认防火墙，修改SSH端口后需要更新防火墙规则：
+
+```bash
+# 允许新的SSH端口
+sudo ufw allow 2222/tcp
+
+# 重新加载防火墙
+sudo ufw reload
+
+# 查看防火墙状态
+sudo ufw status
+```
+
+### Ubuntu 服务管理
+
+在Ubuntu系统中，SSH服务名称为`ssh`（而不是其他系统的`sshd`）：
+
+```bash
+# 检查SSH服务状态
+sudo systemctl status ssh
+
+# 重启SSH服务
+sudo systemctl restart ssh
+
+# 启用SSH服务开机自启
+sudo systemctl enable ssh
+```
+
+### Ubuntu 常见问题解决
+
+#### 1. SSH配置文件不存在
+```bash
+# 安装SSH服务
+sudo apt update && sudo apt install -y openssh-server
+```
+
+#### 2. 缺少必要命令
+```bash
+# 安装curl、wget等工具
+sudo apt update && sudo apt install -y curl wget gawk
+```
+
+#### 3. 权限问题
+确保使用sudo运行脚本：
+```bash
+sudo ./root_ssh_modifier.sh -p 2222
 ```
 
 ## 📊 脚本特性

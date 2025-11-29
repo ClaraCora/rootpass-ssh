@@ -27,10 +27,22 @@ detect_system() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$NAME; VER=$VERSION_ID
+        # 特别处理Ubuntu系统
+        if [[ "$ID" == "ubuntu" ]]; then
+            OS="Ubuntu"
+        fi
     elif type lsb_release >/dev/null 2>&1; then
         OS=$(lsb_release -si); VER=$(lsb_release -sr)
+        # 标准化Ubuntu名称
+        if [[ "$OS" == "Ubuntu" ]]; then
+            OS="Ubuntu"
+        fi
     elif [ -f /etc/lsb-release ]; then
         . /etc/lsb-release; OS=$DISTRIB_ID; VER=$DISTRIB_RELEASE
+        # 标准化Ubuntu名称
+        if [[ "$OS" == "Ubuntu" ]]; then
+            OS="Ubuntu"
+        fi
     elif [ -f /etc/debian_version ]; then
         OS=Debian; VER=$(cat /etc/debian_version)
     elif [ -f /etc/redhat-release ]; then
@@ -42,7 +54,47 @@ detect_system() {
 }
 
 need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || { echo -e "${ERROR} 需要命令: $1"; exit 1; }
+    command -v "$1" >/dev/null 2>&1 || {
+        echo -e "${ERROR} 需要命令: $1"
+        # 为Ubuntu系统提供安装建议
+        if [[ "$OS" == "Ubuntu" ]]; then
+            case "$1" in
+                curl) echo -e "${INFO} 在Ubuntu上安装: sudo apt update && sudo apt install -y curl" ;;
+                wget) echo -e "${INFO} 在Ubuntu上安装: sudo apt update && sudo apt install -y wget" ;;
+                awk) echo -e "${INFO} 在Ubuntu上安装: sudo apt update && sudo apt install -y gawk" ;;
+                *) echo -e "${INFO} 尝试安装: sudo apt update && sudo apt install -y $1" ;;
+            esac
+        fi
+        exit 1
+    }
+}
+
+# 检查并安装必要的包（Ubuntu特定）
+check_ubuntu_packages() {
+    if [[ "$OS" == "Ubuntu" ]]; then
+        local missing_packages=()
+        
+        # 检查常用命令
+        for cmd in curl wget awk; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+                missing_packages+=("$cmd")
+            fi
+        done
+        
+        if [ ${#missing_packages[@]} -gt 0 ]; then
+            echo -e "${WARNING} Ubuntu系统缺少以下命令: ${missing_packages[*]}"
+            echo -e "${INFO} 可以使用以下命令安装:"
+            echo -e "sudo apt update && sudo apt install -y ${missing_packages[*]}"
+            read -p "是否现在安装? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                $SUDO apt update && $SUDO apt install -y "${missing_packages[@]}" || {
+                    echo -e "${ERROR} 包安装失败，请手动安装"
+                    exit 1
+                }
+            fi
+        fi
+    fi
 }
 
 #---------------------- 用法 -----------------------
@@ -72,7 +124,16 @@ EOF
 
 #---------------------- SSH 配置辅助 -----------------------
 backup_sshd_once() {
-    [ -f /etc/ssh/sshd_config ] || { echo -e "${ERROR} 未找到 /etc/ssh/sshd_config"; exit 1; }
+    [ -f /etc/ssh/sshd_config ] || {
+        echo -e "${ERROR} 未找到 /etc/ssh/sshd_config"
+        # Ubuntu特定提示
+        if [[ "$OS" == "Ubuntu" ]]; then
+            echo -e "${INFO} 在Ubuntu系统中，SSH配置文件通常位于 /etc/ssh/sshd_config"
+            echo -e "${INFO} 如果文件不存在，可能需要安装SSH服务:"
+            echo -e "sudo apt update && sudo apt install -y openssh-server"
+        fi
+        exit 1
+    }
     if [ -z "$SSHD_BACKED_UP" ]; then
         $SUDO cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
         SSHD_BACKED_UP=1
@@ -198,16 +259,38 @@ change_ssh_port() {
 restart_ssh_service() {
     echo -e "${INFO} 正在重启SSH服务..."
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet sshd; then $SUDO systemctl restart sshd
-        elif systemctl is-active --quiet ssh; then $SUDO systemctl restart ssh
+        # 优先检查Ubuntu系统的ssh服务
+        if [[ "$OS" == "Ubuntu" ]]; then
+            if systemctl is-active --quiet ssh; then
+                $SUDO systemctl restart ssh
+            elif systemctl is-active --quiet sshd; then
+                $SUDO systemctl restart sshd
+            else
+                echo -e "${WARNING} 未找到活动的SSH服务，尝试启动..."
+                $SUDO systemctl start ssh 2>/dev/null || $SUDO systemctl start sshd 2>/dev/null
+            fi
         else
-            echo -e "${WARNING} 未找到活动的SSH服务，尝试启动..."
-            $SUDO systemctl start sshd 2>/dev/null || $SUDO systemctl start ssh 2>/dev/null
+            # 非Ubuntu系统的处理逻辑
+            if systemctl is-active --quiet sshd; then
+                $SUDO systemctl restart sshd
+            elif systemctl is-active --quiet ssh; then
+                $SUDO systemctl restart ssh
+            else
+                echo -e "${WARNING} 未找到活动的SSH服务，尝试启动..."
+                $SUDO systemctl start sshd 2>/dev/null || $SUDO systemctl start ssh 2>/dev/null
+            fi
         fi
     elif command -v service >/dev/null 2>&1; then
-        $SUDO service ssh restart 2>/dev/null || $SUDO service sshd restart 2>/dev/null
+        # Ubuntu系统优先尝试ssh服务
+        if [[ "$OS" == "Ubuntu" ]]; then
+            $SUDO service ssh restart 2>/dev/null || $SUDO service sshd restart 2>/dev/null
+        else
+            $SUDO service sshd restart 2>/dev/null || $SUDO service ssh restart 2>/dev/null
+        fi
     elif [ -x /etc/init.d/ssh ]; then
         $SUDO /etc/init.d/ssh restart
+    elif [ -x /etc/init.d/sshd ]; then
+        $SUDO /etc/init.d/sshd restart
     else
         echo -e "${WARNING} 无法自动重启SSH服务，请手动重启"
         return 1
@@ -218,12 +301,24 @@ restart_ssh_service() {
 check_ssh_status() {
     echo -e "${INFO} 检查SSH服务状态..."
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet sshd; then
-            echo -e "${SUCCESS} SSH服务正在运行 (sshd)"
-        elif systemctl is-active --quiet ssh; then
-            echo -e "${SUCCESS} SSH服务正在运行 (ssh)"
+        # Ubuntu系统优先检查ssh服务
+        if [[ "$OS" == "Ubuntu" ]]; then
+            if systemctl is-active --quiet ssh; then
+                echo -e "${SUCCESS} SSH服务正在运行 (ssh)"
+            elif systemctl is-active --quiet sshd; then
+                echo -e "${SUCCESS} SSH服务正在运行 (sshd)"
+            else
+                echo -e "${WARNING} SSH服务未运行"
+            fi
         else
-            echo -e "${WARNING} SSH服务未运行"
+            # 非Ubuntu系统的处理逻辑
+            if systemctl is-active --quiet sshd; then
+                echo -e "${SUCCESS} SSH服务正在运行 (sshd)"
+            elif systemctl is-active --quiet ssh; then
+                echo -e "${SUCCESS} SSH服务正在运行 (ssh)"
+            else
+                echo -e "${WARNING} SSH服务未运行"
+            fi
         fi
     else
         if pgrep sshd >/dev/null; then echo -e "${SUCCESS} SSH服务正在运行"
@@ -288,6 +383,8 @@ main() {
     [ $# -eq 0 ] && { USAGE; exit 1; }
 
     detect_system
+    # Ubuntu系统特定检查
+    check_ubuntu_packages
     show_current_config; echo
 
     # 修改账户/端口
